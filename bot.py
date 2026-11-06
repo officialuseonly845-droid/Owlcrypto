@@ -1,3 +1,4 @@
+
 import asyncio
 import html
 import json
@@ -18,6 +19,8 @@ from telegram.ext import (
     ChatMemberHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 # -------------------- CONFIG --------------------
@@ -54,9 +57,10 @@ log = logging.getLogger("pelican-news-bot")
 session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT})
 
-# Runtime data
 data_lock = threading.RLock()
 data = {"chats": {}, "seen_news": []}
+
+SIGNATURE = "Signature - CRYPTO OWL 🦉"
 
 
 # -------------------- DATA STORAGE --------------------
@@ -107,11 +111,7 @@ def remember_chat(chat):
 
     save_data()
 
-    log.info(
-        "Registered destination: %s (%s)",
-        chat.title,
-        chat.id,
-    )
+    log.info("Registered destination: %s (%s)", chat.title, chat.id)
 
 
 def forget_chat(chat_id):
@@ -123,7 +123,7 @@ def forget_chat(chat_id):
 
 def get_chat_ids():
     with data_lock:
-        return [int(chat_id) for chat_id in data["chats"].keys()]
+        return [int(chat_id) for chat_id in data["chats"]]
 
 
 def has_seen(news_id):
@@ -142,7 +142,7 @@ def mark_seen(news_id):
 
 # -------------------- WATCHER.GURU SCRAPER --------------------
 
-def _image_from_container(container):
+def image_from_container(container):
     if container is None:
         return None
 
@@ -168,20 +168,24 @@ def _image_from_container(container):
             candidate = urljoin(NEWS_URL, candidate.strip())
             parsed = urlparse(candidate)
 
-            if (
-                parsed.scheme in ("http", "https")
-                and not candidate.lower().endswith(".svg")
-            ):
-                if (
-                    "logo" not in parsed.path.lower()
-                    and "icon" not in parsed.path.lower()
-                ):
-                    return candidate
+            if parsed.scheme not in ("http", "https"):
+                continue
+
+            if candidate.lower().endswith(".svg"):
+                continue
+
+            if "logo" in parsed.path.lower():
+                continue
+
+            if "icon" in parsed.path.lower():
+                continue
+
+            return candidate
 
     return None
 
 
-def _article_description(article_url):
+def article_description(article_url):
     """Retrieve a short publisher-provided description."""
 
     try:
@@ -207,17 +211,12 @@ def _article_description(article_url):
                 return " ".join(tag["content"].split())[:900]
 
     except requests.RequestException:
-        log.warning(
-            "Could not retrieve article description: %s",
-            article_url,
-        )
+        log.warning("Could not retrieve description: %s", article_url)
 
     return ""
 
 
 def scrape_latest_news(limit=20):
-    """Extract publicly visible news cards from Watcher.Guru."""
-
     response = session.get(
         NEWS_URL,
         timeout=REQUEST_TIMEOUT,
@@ -281,21 +280,20 @@ def scrape_latest_news(limit=20):
         ):
             continue
 
-        if (
-            "/news/" not in parsed.path
-            or parsed.path.rstrip("/") == "/news"
-        ):
+        if "/news/" not in parsed.path:
+            continue
+
+        if parsed.path.rstrip("/") == "/news":
             continue
 
         if article_url in seen_urls:
             continue
 
-        # Find the article card image.
         container = heading
         image_url = None
 
         for _ in range(6):
-            image_url = _image_from_container(container)
+            image_url = image_from_container(container)
 
             if image_url:
                 break
@@ -305,7 +303,6 @@ def scrape_latest_news(limit=20):
             if container is None:
                 break
 
-        # Try the article's Open Graph image if necessary.
         if not image_url:
             try:
                 article_response = session.get(
@@ -332,14 +329,11 @@ def scrape_latest_news(limit=20):
                     )
 
             except requests.RequestException:
-                log.warning(
-                    "Could not retrieve article image: %s",
-                    article_url,
-                )
+                log.warning("Could not retrieve article image.")
 
         news_id = article_url.rstrip("/")
 
-        description = _article_description(article_url)
+        description = article_description(article_url)
 
         found.append({
             "id": news_id,
@@ -358,9 +352,6 @@ def scrape_latest_news(limit=20):
 
 
 # -------------------- TELEGRAM RICH MESSAGE --------------------
-
-SIGNATURE = "Signature - CRYPTO OWL 🦉"
-
 
 def build_rich_article_html(item):
 
@@ -395,9 +386,7 @@ def build_rich_article_html(item):
         )
 
     if description:
-        parts.append(
-            f"<p>{description}</p>"
-        )
+        parts.append(f"<p>{description}</p>")
     else:
         parts.append(
             "<p>Read the original report for the latest "
@@ -419,7 +408,6 @@ def build_rich_article_html(item):
 
 
 def send_rich_article_sync(chat_id, item):
-    """Send an article-style Telegram Rich Message."""
 
     endpoint = (
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendRichMessage"
@@ -454,7 +442,6 @@ def send_rich_article_sync(chat_id, item):
 
 
 async def send_news_to_chat(bot, chat_id, item):
-
     await asyncio.to_thread(
         send_rich_article_sync,
         chat_id,
@@ -488,11 +475,11 @@ async def broadcast_news(bot, item):
                 (chat_id, str(exc)[:180])
             )
 
-            message = str(exc).lower()
+            error_text = str(exc).lower()
 
             if (
-                "chat not found" in message
-                or "bot was kicked" in message
+                "chat not found" in error_text
+                or "bot was kicked" in error_text
             ):
                 forget_chat(chat_id)
 
@@ -500,6 +487,12 @@ async def broadcast_news(bot, item):
 
             failed.append(
                 (chat_id, str(exc)[:180])
+            )
+
+            log.warning(
+                "Delivery failed for %s: %s",
+                chat_id,
+                exc,
             )
 
         await asyncio.sleep(0.05)
@@ -520,7 +513,6 @@ async def register_group_updates(
         return
 
     chat = member_update.chat
-
     new_status = member_update.new_chat_member.status
 
     if new_status in ("member", "administrator"):
@@ -592,9 +584,7 @@ async def post_command(
 
         if not payload:
             await message.reply_text(
-                "Usage: send a photo with caption "
-                "`/post your message`, or use `/post your text`.",
-                parse_mode="Markdown",
+                "Send a photo with caption /post Your message"
             )
             return
 
@@ -632,7 +622,6 @@ async def post_command(
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=f"{payload}\n\n{SIGNATURE}",
-                    disable_web_page_preview=False,
                 )
 
             sent += 1
@@ -676,7 +665,6 @@ async def photo_post_command(
 ):
 
     message = update.effective_message
-
     caption = message.caption or ""
 
     if re.match(
@@ -712,7 +700,7 @@ async def extract_command(
         log.exception("Manual extraction failed")
 
         await status.edit_text(
-            f"Could not fetch the news right now: {str(exc)[:300]}"
+            f"Could not fetch news: {str(exc)[:300]}"
         )
 
         return
@@ -751,8 +739,6 @@ async def extract_command(
 
 async def initialize_news_baseline(application: Application):
 
-    """Avoid broadcasting old stories immediately after startup."""
-
     try:
 
         items = await asyncio.to_thread(
@@ -769,10 +755,7 @@ async def initialize_news_baseline(application: Application):
         )
 
     except Exception:
-
-        log.exception(
-            "Could not initialize news baseline."
-        )
+        log.exception("Could not initialize news baseline.")
 
 
 async def automatic_news_job(
@@ -792,7 +775,6 @@ async def automatic_news_job(
             if not has_seen(item["id"])
         ]
 
-        # Send oldest first if multiple stories appeared.
         for item in reversed(new_items):
 
             sent, failed = await broadcast_news(
@@ -810,17 +792,14 @@ async def automatic_news_job(
             )
 
     except Exception:
-
-        log.exception(
-            "Automatic news check failed."
-        )
+        log.exception("Automatic news check failed.")
 
 
 # -------------------- RENDER HEALTH SERVER --------------------
 
 class HealthHandler(BaseHTTPRequestHandler):
 
-    def do_GET(self):
+    def _send_health_response(self, include_body=True):
 
         if self.path not in (
             "/",
@@ -830,7 +809,9 @@ class HealthHandler(BaseHTTPRequestHandler):
 
             self.send_response(404)
             self.end_headers()
-            self.wfile.write(b"Not found")
+
+            if include_body:
+                self.wfile.write(b"Not found")
 
             return
 
@@ -850,10 +831,16 @@ class HealthHandler(BaseHTTPRequestHandler):
 
         self.end_headers()
 
-        self.wfile.write(body)
+        if include_body:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        self._send_health_response(include_body=True)
+
+    def do_HEAD(self):
+        self._send_health_response(include_body=False)
 
     def log_message(self, format_string, *args):
-
         log.info(
             "HTTP %s - %s",
             self.address_string(),
@@ -863,9 +850,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def start_http_server():
 
-    port = int(
-        os.getenv("PORT", "10000")
-    )
+    port = int(os.getenv("PORT", "10000"))
 
     server = ThreadingHTTPServer(
         ("0.0.0.0", port),
@@ -928,8 +913,6 @@ def main():
         CommandHandler("extract", extract_command)
     )
 
-    from telegram.ext import MessageHandler, filters
-
     application.add_handler(
         MessageHandler(
             filters.PHOTO & filters.CAPTION,
@@ -946,6 +929,13 @@ def main():
     )
 
     log.info("Starting Pelican Telegram bot.")
+
+    # Python 3.14 compatibility fix:
+    # Create an event loop before python-telegram-bot calls run_polling().
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
     application.run_polling(
         allowed_updates=[
